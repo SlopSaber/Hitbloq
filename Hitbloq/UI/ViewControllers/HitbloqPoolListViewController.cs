@@ -12,6 +12,7 @@ using Hitbloq.Other;
 using Hitbloq.Sources;
 using Hitbloq.Utilities;
 using HMUI;
+using IPA.Utilities;
 using IPA.Utilities.Async;
 using Tweening;
 using UnityEngine;
@@ -44,8 +45,10 @@ namespace Hitbloq.UI.ViewControllers
 		[Inject]
 		private readonly TimeTweeningManager _uwuTweenyManager = null!;
 
-		private CancellationTokenSource? _poolCancellationTokenSource;
-		private CancellationTokenSource? _sortCancellationTokenSource;
+		private CancellationTokenSource? _fetchCancellationTokenSource;
+		private int _fetchRevision;
+		private bool _viewActive;
+		private bool _refreshNeeded;
 
 		public event Action<HitbloqPoolListEntry>? PoolSelectedEvent;
 		public event Action? DetailDismissRequested;
@@ -53,18 +56,16 @@ namespace Hitbloq.UI.ViewControllers
 		protected override void DidActivate(bool firstActivation, bool addedToHierarchy, bool screenSystemEnabling)
 		{
 			base.DidActivate(firstActivation, addedToHierarchy, screenSystemEnabling);
+			_viewActive = true;
 
 			if (_customListTableData != null)
 			{
 				BSMLCompat.TableView(_customListTableData).ClearSelection();
 			}
 
-			if (_pools.Count == 0)
+			if (_pools.Count == 0 || _refreshNeeded)
 			{
-				_poolCancellationTokenSource?.Cancel();
-				_poolCancellationTokenSource?.Dispose();
-				_poolCancellationTokenSource = new CancellationTokenSource();
-				_ = FetchPools(_poolCancellationTokenSource.Token);
+				RequestPools();
 			}
 			else
 			{
@@ -72,86 +73,266 @@ namespace Hitbloq.UI.ViewControllers
 			}
 		}
 
-		private async Task FetchPools(CancellationToken cancellationToken = default)
+		protected override void DidDeactivate(bool removedFromHierarchy, bool screenSystemDisabling)
 		{
-			if (_customListTableData == null)
-			{
-				return;
-			}
+			RetireFetch();
+			base.DidDeactivate(removedFromHierarchy, screenSystemDisabling);
+		}
 
-			await _poolLoadSemaphore.WaitAsync(cancellationToken);
-			if (cancellationToken.IsCancellationRequested)
-			{
-				return;
-			}
+		protected override void OnDestroy()
+		{
+			RetireFetch();
+			base.OnDestroy();
+		}
 
+		private void RetireFetch()
+		{
+			_viewActive = false;
+			_fetchRevision++;
+			CancelFetch();
+		}
+
+		private void CancelFetch()
+		{
+			_fetchCancellationTokenSource?.Cancel();
+			_fetchCancellationTokenSource?.Dispose();
+			_fetchCancellationTokenSource = null;
+		}
+
+		private void RequestPools()
+		{
+			CancelFetch();
+			_fetchCancellationTokenSource = new CancellationTokenSource();
+			_refreshNeeded = true;
+			_ = FetchPools(++_fetchRevision, _fetchCancellationTokenSource.Token);
+		}
+
+		private bool IsCurrent(int revision, CancellationToken cancellationToken)
+		{
+			return this && _viewActive && isActivated && isActiveAndEnabled &&
+			       revision == _fetchRevision && !cancellationToken.IsCancellationRequested;
+		}
+
+		private async Task FetchPools(int revision, CancellationToken cancellationToken)
+		{
+			var acquired = false;
 			try
 			{
-				await UnityMainThreadTaskScheduler.Factory.StartNew(() =>
-				{
-					BSMLCompat.TableView(_customListTableData).ClearSelection();
-					Loaded = false;
-				});
-
-				// We check the cancellationtoken at each interval instead of running everything with a single token
-				// due to unity not liking it
-				if (cancellationToken.IsCancellationRequested)
+				await _poolLoadSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+				acquired = true;
+				await UnityGame.SwitchToMainThreadAsync();
+				if (!IsCurrent(revision, cancellationToken) || _customListTableData == null)
 				{
 					return;
 				}
 
-				var fetchedPools = await _poolListSource.GetAsync(cancellationToken);
-
-				if (fetchedPools == null || cancellationToken.IsCancellationRequested)
+				BSMLCompat.TableView(_customListTableData).ClearSelection();
+				Loaded = false;
+				var fetchedPools = await _poolListSource.GetAsync(cancellationToken).ConfigureAwait(false);
+				await UnityGame.SwitchToMainThreadAsync();
+				if (fetchedPools == null)
 				{
 					return;
 				}
 
-				switch (_sortOption)
+				while (IsCurrent(revision, cancellationToken))
 				{
-					case "Popularity":
-						fetchedPools.Sort(HitbloqPoolListEntry.PopularityComparer);
-						break;
-					case "Player Count":
-						fetchedPools.Sort(HitbloqPoolListEntry.PlayerCountComparer);
-						break;
-					case "Alphabetical":
-						fetchedPools.Sort(HitbloqPoolListEntry.NameComparer);
-						break;
-				}
+					var originals = fetchedPools.ToArray();
+					var keys = new PoolSortKey[originals.Length];
+					for (var i = 0; i < originals.Length; i++)
+					{
+						keys[i] = new PoolSortKey(originals[i]);
+					}
+					var request = new PoolSortRequest(keys, _sortOption, _sortDescending);
+					var physicalTask = Task.Factory.StartNew(PoolSortRequest.Process, request,
+						CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+					var indices = await physicalTask.ConfigureAwait(false);
+					await UnityGame.SwitchToMainThreadAsync();
+					if (!IsCurrent(revision, cancellationToken))
+					{
+						return;
+					}
+					if (!SnapshotMatches(fetchedPools, originals, keys))
+					{
+						continue;
+					}
 
-				if (_sortDescending)
-				{
-					fetchedPools.Reverse();
+					if (request.Sorts || request.Descending)
+					{
+						for (var i = 0; i < indices.Length; i++)
+						{
+							fetchedPools[i] = originals[indices[i]];
+						}
+						// Empty sorts still invalidate existing enumerators.
+						if (indices.Length == 0)
+						{
+							fetchedPools.Reverse(0, 0);
+						}
+					}
+					_pools.Clear();
+					_pools.AddRange(fetchedPools);
+					_refreshNeeded = false;
+					break;
 				}
-
-				_pools.Clear();
-				_pools.AddRange(fetchedPools);
+			}
+			catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+			{
 			}
 			finally
 			{
-				Loaded = true;
-				await SiraUtil.Extras.Utilities.PauseChamp;
-				await UnityMainThreadTaskScheduler.Factory.StartNew(() => { BSMLCompat.TableView(_customListTableData).ReloadData(); });
-				DetailDismissRequested?.Invoke();
-				_poolLoadSemaphore.Release();
+				if (acquired)
+				{
+					_poolLoadSemaphore.Release();
+					await FinishFetch(revision, cancellationToken);
+				}
+			}
+		}
+
+		private async Task FinishFetch(int revision, CancellationToken cancellationToken)
+		{
+			await UnityGame.SwitchToMainThreadAsync();
+			if (!IsCurrent(revision, cancellationToken) || _customListTableData == null)
+			{
+				return;
+			}
+			Loaded = true;
+			await SiraUtil.Extras.Utilities.PauseChamp;
+			await UnityGame.SwitchToMainThreadAsync();
+			if (!IsCurrent(revision, cancellationToken))
+			{
+				return;
+			}
+			BSMLCompat.TableView(_customListTableData).ReloadData();
+			if (!IsCurrent(revision, cancellationToken))
+			{
+				return;
+			}
+			DetailDismissRequested?.Invoke();
+			if (IsCurrent(revision, cancellationToken))
+			{
 				OpenPoolToSelect();
+			}
+		}
+
+		private static bool SnapshotMatches(List<HitbloqPoolListEntry> pools,
+			HitbloqPoolListEntry[] originals, PoolSortKey[] keys)
+		{
+			if (pools.Count != originals.Length)
+			{
+				return false;
+			}
+			for (var i = 0; i < originals.Length; i++)
+			{
+				if (!ReferenceEquals(pools[i], originals[i]) || !keys[i].Matches(pools[i]))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		private readonly struct PoolSortKey
+		{
+			public readonly bool Present;
+			public readonly string? Title;
+			public readonly int PlayerCount;
+			public readonly int Popularity;
+
+			public PoolSortKey(HitbloqPoolListEntry? entry)
+			{
+				Present = entry != null;
+				Title = entry?.Title;
+				PlayerCount = entry?.PlayerCount ?? 0;
+				Popularity = entry?.Popularity ?? 0;
+			}
+
+			public bool Matches(HitbloqPoolListEntry? entry)
+			{
+				return entry == null ? !Present : Present &&
+					string.Equals(Title, entry.Title, StringComparison.Ordinal) &&
+					PlayerCount == entry.PlayerCount && Popularity == entry.Popularity;
+			}
+		}
+
+		private sealed class PoolSortRequest : IComparer<int>
+		{
+			private readonly PoolSortKey[] _keys;
+			private readonly string _option;
+			public readonly bool Descending;
+			public bool Sorts => _option == "Popularity" || _option == "Player Count" || _option == "Alphabetical";
+
+			public PoolSortRequest(PoolSortKey[] keys, string option, bool descending)
+			{
+				_keys = keys;
+				_option = option;
+				Descending = descending;
+			}
+
+			public int Compare(int x, int y)
+			{
+				var left = _keys[x];
+				var right = _keys[y];
+				if (!left.Present)
+				{
+					return right.Present ? -1 : 0;
+				}
+				if (!right.Present)
+				{
+					return 1;
+				}
+				return _option switch
+				{
+					"Popularity" => left.Popularity.CompareTo(right.Popularity),
+					"Player Count" => left.PlayerCount.CompareTo(right.PlayerCount),
+					"Alphabetical" => string.Compare(left.Title, right.Title, StringComparison.Ordinal),
+					_ => 0
+				};
+			}
+
+			public static int[] Process(object state)
+			{
+				var request = (PoolSortRequest) state;
+				var indices = new int[request._keys.Length];
+				for (var i = 0; i < indices.Length; i++)
+				{
+					indices[i] = i;
+				}
+				if (request.Sorts)
+				{
+					Array.Sort(indices, request);
+				}
+				if (request.Descending)
+				{
+					Array.Reverse(indices);
+				}
+				return indices;
 			}
 		}
 
 		private void OpenPoolToSelect()
 		{
-			if (poolToOpen != null && _customListTableData != null)
+			if (this && _viewActive && isActivated && isActiveAndEnabled && !_refreshNeeded && poolToOpen != null && _customListTableData != null)
 			{
 				for (var i = 0; i < _pools.Count; i++)
 				{
 					if (_pools[i].ID == poolToOpen)
 					{
+						var index = i;
+						var entry = _pools[index];
+						var revision = _fetchRevision;
 						_ = UnityMainThreadTaskScheduler.Factory.StartNew(() =>
 						{
-							BSMLCompat.TableView(_customListTableData).SelectCellWithIdx(i);
-							BSMLCompat.TableView(_customListTableData).ScrollToCellWithIdx(i, TableView.ScrollPositionType.Center, true);
-							PoolSelectedEvent?.Invoke(_pools[i]);
+							if (_refreshNeeded || !IsCurrent(revision, CancellationToken.None) || index >= _pools.Count || !ReferenceEquals(entry, _pools[index]))
+							{
+								return;
+							}
+							BSMLCompat.TableView(_customListTableData).SelectCellWithIdx(index);
+							if (_refreshNeeded || !IsCurrent(revision, CancellationToken.None))
+							{
+								return;
+							}
+							BSMLCompat.TableView(_customListTableData).ScrollToCellWithIdx(index, TableView.ScrollPositionType.Center, true);
+							PoolSelectedEvent?.Invoke(entry);
 						});
 						break;
 					}
@@ -186,11 +367,8 @@ namespace Hitbloq.UI.ViewControllers
 		[UIAction("sort-selected")]
 		private void SortSelected(string sortOption)
 		{
-			_sortCancellationTokenSource?.Cancel();
-			_sortCancellationTokenSource?.Dispose();
-			_sortCancellationTokenSource = new CancellationTokenSource();
 			_sortOption = sortOption;
-			_ = FetchPools(_sortCancellationTokenSource.Token);
+			RequestPools();
 		}
 
 		[UIAction("toggle-sort-direction")]
@@ -199,10 +377,7 @@ namespace Hitbloq.UI.ViewControllers
 			_sortDescending = !_sortDescending;
 			NotifyPropertyChanged(nameof(SortDirection));
 
-			_sortCancellationTokenSource?.Cancel();
-			_sortCancellationTokenSource?.Dispose();
-			_sortCancellationTokenSource = new CancellationTokenSource();
-			_ = FetchPools(_sortCancellationTokenSource.Token);
+			RequestPools();
 		}
 
 		[UIValue("sort-options")]
