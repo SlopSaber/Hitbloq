@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,7 +16,6 @@ using Hitbloq.Sources;
 using Hitbloq.Utilities;
 using HMUI;
 using IPA.Utilities;
-using IPA.Utilities.Async;
 using UnityEngine;
 using Zenject;
 
@@ -76,6 +76,12 @@ namespace Hitbloq.UI.ViewControllers
 
 		private CancellationTokenSource? _poolInfoTokenSource;
 		private List<string>? _poolNames;
+		private readonly SemaphoreSlim _optionPreparationSemaphore = new(1, 1);
+		private int _optionRevision;
+		private int _rankRevision;
+		private bool _disposed;
+		private bool _dropdownReady;
+		private bool _optionsPending;
 
 		[UIValue("pools")] private List<object> _pools = new() {"None"};
 		private string _promptText = "";
@@ -175,10 +181,23 @@ namespace Hitbloq.UI.ViewControllers
 
 		public void Dispose()
 		{
+			_disposed = true;
+			_dropdownReady = false;
+			_optionRevision++;
+			_poolInfoTokenSource?.Cancel();
+			_poolInfoTokenSource?.Dispose();
+			_poolInfoTokenSource = null;
+			RetireRank();
 			if (_playlistManagerIHardlyKnowHer != null)
 			{
 				_playlistManagerIHardlyKnowHer.HitbloqPlaylistSelected -= OnPlaylistSelected;
 			}
+		}
+
+		protected override void OnDestroy()
+		{
+			Dispose();
+			base.OnDestroy();
 		}
 
 		public void Initialize()
@@ -248,10 +267,9 @@ namespace Hitbloq.UI.ViewControllers
 			BSMLCompat.Dropdown(_dropDownListSetting).SetField("_numberOfVisibleCells", 2);
 			BSMLCompat.SetValues(_dropDownListSetting, new List<object> {"1", "2"});
 			_dropDownListSetting.UpdateChoices();
-			BSMLCompat.SetValues(_dropDownListSetting, _pools.Count != 0 ? _pools : new List<object> {"None"});
-			_dropDownListSetting.UpdateChoices();
-			var poolIndex = _poolNames?.IndexOf(_selectedPool ?? "") ?? 0;
-			BSMLCompat.Dropdown(_dropDownListSetting).SelectCellWithIdx(poolIndex == -1 ? 0 : poolIndex);
+			var poolIndex = _optionsPending ? 0 : _poolNames?.IndexOf(_selectedPool ?? "") ?? 0;
+			_dropdownReady = true;
+			RefreshDropdown(poolIndex, _optionRevision, false);
 
 			_defaultHighlightColour = _playlistManagerImage!.HighlightColor;
 
@@ -287,18 +305,26 @@ namespace Hitbloq.UI.ViewControllers
 		[UIAction("pool-changed")]
 		private void PoolChanged(string formattedPool)
 		{
-			if (_dropDownListSetting != null && _poolNames != null)
+			if (!_disposed && _dropdownReady && !_optionsPending && _dropDownListSetting != null && _poolNames != null)
 			{
-				PoolChangedEvent?.Invoke(_poolNames[BSMLCompat.Dropdown(_dropDownListSetting).selectedIndex]);
+				var index = BSMLCompat.Dropdown(_dropDownListSetting).selectedIndex;
+				if (index >= 0 && index < _poolNames.Count)
+				{
+					PoolChangedEvent?.Invoke(_poolNames[index]);
+				}
 			}
 		}
 
 		[UIAction("clicked-rank-text")]
 		private void RankTextClicked()
 		{
-			if (_dropDownListSetting != null && _rankInfo != null && _poolNames != null)
+			if (!_disposed && _dropdownReady && !_optionsPending && _dropDownListSetting != null && _rankInfo != null && _poolNames != null)
 			{
-				RankTextClickedEvent?.Invoke(_rankInfo, _poolNames[BSMLCompat.Dropdown(_dropDownListSetting).selectedIndex]);
+				var index = BSMLCompat.Dropdown(_dropDownListSetting).selectedIndex;
+				if (index >= 0 && index < _poolNames.Count)
+				{
+					RankTextClickedEvent?.Invoke(_rankInfo, _poolNames[index]);
+				}
 			}
 		}
 
@@ -340,92 +366,164 @@ namespace Hitbloq.UI.ViewControllers
 
 		private async Task BeatmapKeyUpdatedAsync(HitbloqLevelInfo? levelInfoEntry)
 		{
+			if (_disposed || !this)
+			{
+				return;
+			}
 			_poolInfoTokenSource?.Cancel();
 			_poolInfoTokenSource?.Dispose();
 			_poolInfoTokenSource = new CancellationTokenSource();
-
+			var cancellationToken = _poolInfoTokenSource.Token;
+			var revision = ++_optionRevision;
+			_optionsPending = true;
 			_pools = new List<object>();
-			_rankInfo = null;
+			RetireRank();
+			var poolSnapshot = levelInfoEntry?.Pools.ToArray();
+			var acquired = false;
 
-			if (levelInfoEntry != null)
+			try
 			{
-				var pools = levelInfoEntry.Pools.ToList();
-				var detailedPools = await _poolListSource.GetAsync(_poolInfoTokenSource.Token);
-
-				if (detailedPools != null)
+				await _optionPreparationSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+				acquired = true;
+				await UnityGame.SwitchToMainThreadAsync();
+				if (!IsOptionsCurrent(revision, cancellationToken))
 				{
-					var popularityByPool = detailedPools.ToDictionary(pool => pool.ID, pool => pool.Popularity);
-					pools = pools
-						.OrderByDescending(pool => popularityByPool.TryGetValue(pool.Key, out var popularity) ? popularity : int.MinValue)
-						.ThenBy(pool => pool.Key, StringComparer.Ordinal)
-						.ToList();
+					return;
 				}
 
-				foreach (var pool in pools)
+				var names = new List<string>();
+				var labels = new List<object>();
+				if (poolSnapshot != null)
 				{
-					var poolInfo = await _poolInfoSource.GetPoolInfoAsync(pool.Key, _poolInfoTokenSource.Token);
-
-					var poolName = poolInfo?.ShownName.RemoveSpecialCharacters() ?? pool.Key;
-					if (poolName.DoesNotHaveAlphaNumericCharacters())
+					var detailedPools = await _poolListSource.GetAsync(cancellationToken).ConfigureAwait(false);
+					await UnityGame.SwitchToMainThreadAsync();
+					if (!IsOptionsCurrent(revision, cancellationToken))
 					{
-						poolName = pool.Key;
+						return;
+					}
+					var popularities = detailedPools?.Select(pool => new KeyValuePair<string, int>(pool.ID, pool.Popularity)).ToArray();
+					var sortRequest = new PoolOptionPreparation.SortRequest(poolSnapshot, popularities);
+					var sortTask = Task.Factory.StartNew(PoolOptionPreparation.SortRequest.Process, sortRequest,
+						CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+					var pools = await sortTask.ConfigureAwait(false);
+					await UnityGame.SwitchToMainThreadAsync();
+					if (!IsOptionsCurrent(revision, cancellationToken))
+					{
+						return;
 					}
 
-					if (poolName.Length > 18)
+					foreach (var pool in pools)
 					{
-						poolName = $"{poolName.Substring(0, 15)}...";
+						var poolInfo = await _poolInfoSource.GetPoolInfoAsync(pool.Key, cancellationToken).ConfigureAwait(false);
+						await UnityGame.SwitchToMainThreadAsync();
+						if (!IsOptionsCurrent(revision, cancellationToken))
+						{
+							return;
+						}
+						var shownName = poolInfo?.ShownName;
+						var numberFormat = poolInfo != null && shownName == null ? null :
+							NumberFormatInfo.ReadOnly((NumberFormatInfo) NumberFormatInfo.CurrentInfo.Clone());
+						var labelRequest = new PoolOptionPreparation.LabelRequest(pool.Key, pool.Value, shownName, poolInfo != null, numberFormat);
+						var labelTask = Task.Factory.StartNew(PoolOptionPreparation.LabelRequest.Process, labelRequest,
+							CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+						var label = await labelTask.ConfigureAwait(false);
+						await UnityGame.SwitchToMainThreadAsync();
+						if (!IsOptionsCurrent(revision, cancellationToken))
+						{
+							return;
+						}
+						names.Add(pool.Key);
+						labels.Add(label);
 					}
-
-					_pools.Add($"{poolName} - {pool.Value}⭐");
 				}
 
-				_poolNames = pools.Select(pool => pool.Key).ToList();
-			}
-			else
-			{
-				_poolNames = new List<string> {"None"};
-			}
-
-			int poolIndex;
-
-			if (PluginConfig.Instance.PrioritisePlaylistPool && _playlistManagerIHardlyKnowHer is {SelectedPlaylist: not null})
-			{
-				poolIndex = _poolNames.IndexOf(PlaylistManagerIHardlyKnowHer.GetPlaylistPool(_playlistManagerIHardlyKnowHer.SelectedPlaylist) ?? "");
-			}
-			else
-			{
-				poolIndex = _poolNames.IndexOf(_selectedPool ?? "");
-			}
-			
-			await UnityMainThreadTaskScheduler.Factory.StartNew(() =>
-			{
-				PoolChangedEvent?.Invoke(_poolNames[poolIndex == -1 ? 0 : poolIndex]);
-
-				if (_dropDownListSetting != null)
+				if (names.Count == 0)
 				{
-					BSMLCompat.SetValues(_dropDownListSetting, _pools.Count != 0 ? _pools : new List<object> {"None"});
-					_dropDownListSetting.UpdateChoices();
-					BSMLCompat.Dropdown(_dropDownListSetting).SelectCellWithIdx(poolIndex == -1 ? 0 : poolIndex);
-
-					// Edited by GPT-5 Codex 2026-05-27
-					// Score-refresh success text has its own timed clear path.
-					// Beatmap reload should not erase it immediately after refresh succeeds.
-					if (!LoadingActive && !PromptText.Contains("<color=red>") && !PromptText.Contains("<color=green>"))
-					{
-						PromptText = "";
-					}
+					names.Add("None");
 				}
-			});
+				_poolNames = names;
+				_pools = labels;
+				_optionsPending = false;
+				var selected = _selectedPool;
+				if (PluginConfig.Instance.PrioritisePlaylistPool && _playlistManagerIHardlyKnowHer is {SelectedPlaylist: not null})
+				{
+					selected = PlaylistManagerIHardlyKnowHer.GetPlaylistPool(_playlistManagerIHardlyKnowHer.SelectedPlaylist);
+				}
+				var poolIndex = names.IndexOf(selected ?? "");
+				PoolChangedEvent?.Invoke(names[poolIndex == -1 ? 0 : poolIndex]);
+				if (IsOptionsCurrent(revision, cancellationToken))
+				{
+					RefreshDropdown(poolIndex, revision);
+				}
+			}
+			catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+			{
+			}
+			finally
+			{
+				if (acquired)
+				{
+					_optionPreparationSemaphore.Release();
+				}
+			}
+		}
+
+		private bool IsOptionsCurrent(int revision, CancellationToken cancellationToken)
+		{
+			return !_disposed && this && revision == _optionRevision && !cancellationToken.IsCancellationRequested;
+		}
+
+		private void RefreshDropdown(int poolIndex, int revision, bool clearPrompt = true)
+		{
+			if (!_dropdownReady || _dropDownListSetting == null || !IsOptionsCurrent(revision, CancellationToken.None))
+			{
+				return;
+			}
+			BSMLCompat.SetValues(_dropDownListSetting, _pools.Count != 0 ? _pools : new List<object> {"None"});
+			_dropDownListSetting.UpdateChoices();
+			if (!IsOptionsCurrent(revision, CancellationToken.None))
+			{
+				return;
+			}
+			BSMLCompat.Dropdown(_dropDownListSetting).SelectCellWithIdx(poolIndex == -1 ? 0 : poolIndex);
+			if (clearPrompt && IsOptionsCurrent(revision, CancellationToken.None) &&
+				!LoadingActive && !PromptText.Contains("<color=red>") && !PromptText.Contains("<color=green>"))
+			{
+				PromptText = "";
+			}
+		}
+
+		private void RetireRank(bool clear = true)
+		{
+			_rankRevision++;
+			_rankInfoTokenSource?.Cancel();
+			_rankInfoTokenSource?.Dispose();
+			_rankInfoTokenSource = null;
+			if (clear)
+			{
+				_rankInfo = null;
+			}
 		}
 
 		private async Task PoolUpdatedAsync(string pool)
 		{
-            _rankInfoTokenSource?.Cancel();
-			_rankInfoTokenSource?.Dispose();
+			if (_disposed || !this)
+			{
+				return;
+			}
+			RetireRank(false);
 			_rankInfoTokenSource = new CancellationTokenSource();
+			var cancellationToken = _rankInfoTokenSource.Token;
+			var revision = _rankRevision;
+			var optionRevision = _optionRevision;
 			_selectedPool = pool;
-			_rankInfo = await _rankInfoSource.GetRankInfoForSelfAsync(pool, _rankInfoTokenSource.Token);
-			NotifyPropertyChanged(nameof(PoolRankingText));
+			var rankInfo = await _rankInfoSource.GetRankInfoForSelfAsync(pool, cancellationToken).ConfigureAwait(false);
+			await UnityGame.SwitchToMainThreadAsync();
+			if (IsOptionsCurrent(optionRevision, cancellationToken) && revision == _rankRevision && _selectedPool == pool)
+			{
+				_rankInfo = rankInfo;
+				NotifyPropertyChanged(nameof(PoolRankingText));
+			}
 		}
 	}
 }
