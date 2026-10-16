@@ -1,4 +1,5 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project>
+  <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
 
     <PropertyGroup>
         <TargetFramework>net48</TargetFramework>
@@ -6,7 +7,7 @@
         <LangVersion>9</LangVersion>
         <Nullable>enable</Nullable>
         <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-        <Configurations>Debug;Release;Debug-Latest;Release-Latest;Debug-1.45.0;Release-1.45.0;Debug-1.40.8;Release-1.40.8;Debug-1.29.1;Release-1.29.1;Debug-1.45.1;Release-1.45.1;Debug-1.45.2;Release-1.45.2</Configurations>
+        <Configurations>Debug;Release;Debug-Latest;Release-Latest;Debug-1.45.0;Release-1.45.0;Debug-1.40.8;Release-1.40.8;Debug-1.29.1;Release-1.29.1;Debug-1.45.1;Release-1.45.1;Debug-1.45.2;Release-1.45.2;Debug-1.45.3;Release-1.45.3</Configurations>
         <LocalRefsDir Condition="Exists('..\Refs')">..\Refs</LocalRefsDir>
         <BeatSaberDir>$(LocalRefsDir)</BeatSaberDir>
         <AppOutputBase>$(MSBuildProjectDirectory)\</AppOutputBase>
@@ -26,6 +27,12 @@
         <HitbloqBuildProfile>1.45.2</HitbloqBuildProfile>
         <HitbloqConfigurationType Condition="'$(Configuration)' == 'Debug-1.45.2'">Debug</HitbloqConfigurationType>
         <HitbloqConfigurationType Condition="'$(Configuration)' == 'Release-1.45.2'">Release</HitbloqConfigurationType>
+        <DefineConstants>$(DefineConstants);HITBLOQ_BS_1_45_0</DefineConstants>
+    </PropertyGroup>
+<PropertyGroup Condition="'$(Configuration)' == 'Debug-1.45.3' OR '$(Configuration)' == 'Release-1.45.3'">
+        <HitbloqBuildProfile>1.45.3</HitbloqBuildProfile>
+        <HitbloqConfigurationType Condition="'$(Configuration)' == 'Debug-1.45.3'">Debug</HitbloqConfigurationType>
+        <HitbloqConfigurationType Condition="'$(Configuration)' == 'Release-1.45.3'">Release</HitbloqConfigurationType>
         <DefineConstants>$(DefineConstants);HITBLOQ_BS_1_45_0</DefineConstants>
     </PropertyGroup>
 
@@ -220,4 +227,6 @@
           <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         </PackageReference>
     </ItemGroup>
+  <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+  <Import Project="..\BSIPA.Layout.targets" Condition="Exists('$(GameDirectory)\IPA\Data\Managed\IPA.Loader.dll') OR Exists('$(BeatSaberDir)\IPA\Data\Managed\IPA.Loader.dll')" />
 </Project>
