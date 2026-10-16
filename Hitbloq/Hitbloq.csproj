@@ -11,13 +11,13 @@
         <LocalRefsDir Condition="Exists('..\Refs')">..\Refs</LocalRefsDir>
         <BeatSaberDir>$(LocalRefsDir)</BeatSaberDir>
         <AppOutputBase>$(MSBuildProjectDirectory)\</AppOutputBase>
-        <HitbloqBuildProfile Condition="'$(HitbloqBuildProfile)' == ''">1.45.2</HitbloqBuildProfile>
+        <HitbloqBuildProfile Condition="'$(HitbloqBuildProfile)' == ''">1.45.3</HitbloqBuildProfile>
         <BeatSaberBaseDir Condition="'$(BeatSaberBaseDir)' == ''">D:\BSManager\BSInstances</BeatSaberBaseDir>
         <DebugType>portable</DebugType>
     </PropertyGroup>
 
     <PropertyGroup Condition="'$(Configuration)' == 'Debug-Latest' OR '$(Configuration)' == 'Release-Latest'">
-        <HitbloqBuildProfile>1.45.2</HitbloqBuildProfile>
+        <HitbloqBuildProfile>1.45.3</HitbloqBuildProfile>
         <HitbloqConfigurationType Condition="'$(Configuration)' == 'Debug-Latest'">Debug</HitbloqConfigurationType>
         <HitbloqConfigurationType Condition="'$(Configuration)' == 'Release-Latest'">Release</HitbloqConfigurationType>
         <DefineConstants>$(DefineConstants);HITBLOQ_BS_1_45_0</DefineConstants>
@@ -104,7 +104,7 @@
         <Reference Include="BeatSaber.Multiplayer.Core" Condition="Exists('$(HitbloqBeatSaberDir)\Beat Saber_Data\Managed\BeatSaber.Multiplayer.Core.dll')">
           <HintPath>$(HitbloqBeatSaberDir)\Beat Saber_Data\Managed\BeatSaber.Multiplayer.Core.dll</HintPath>
         </Reference>
-        <Reference Include="BS_Utils" Condition="Exists('$(HitbloqBeatSaberDir)\Plugins\BS_Utils.dll')">
+        <Reference Include="BS_Utils" Condition="Exists('$(HitbloqBeatSaberDir)\Plugins\BS_Utils.dll') OR Exists('$(HitbloqBeatSaberDir)\Mods\BS_Utils.dll') OR Exists('$(HitbloqBeatSaberDir)\Mods\Core\BS_Utils.dll') OR Exists('$(HitbloqBeatSaberDir)\IPA\Pending\BS_Utils.dll') OR Exists('$(HitbloqBeatSaberDir)\IPA\Pending\Core\BS_Utils.dll')">
           <HintPath>$(HitbloqBeatSaberDir)\Plugins\BS_Utils.dll</HintPath>
           <Private>false</Private>
         </Reference>
